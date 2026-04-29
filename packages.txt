@@ -1,8 +1,7 @@
-libatk1.0-0
+chromium
+libnss3
 libatk-bridge2.0-0
-libgdk-pixbuf-2.0-0
 libgtk-3-0
-libgbm-dev
-libnss3-dev
-libxss-dev
+libxss1
 libasound2
+libgbm1
