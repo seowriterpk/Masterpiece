@@ -1,27 +1,37 @@
+import os
 import streamlit as st
+
+# NANO-FEATURE: Run browser install ONLY once per server boot to prevent UI lag
+@st.cache_resource(show_spinner=False)
+def install_browser():
+    os.system("playwright install chromium")
+install_browser()
+
 from streamlit.runtime.scriptrunner import add_script_run_ctx
 from streamlit_autorefresh import st_autorefresh
 import httpx
 import asyncio
 import json
-import os
 import re
 import pandas as pd
 from datetime import datetime
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
-from playwright_stealth import stealth_async
+
+# FIX: Dynamic stealth import. If the library renames itself again, we bypass it instead of crashing.
+try:
+    from playwright_stealth import stealth
+except ImportError:
+    stealth = None
+
 import threading
 import random
 import nest_asyncio
 from filelock import FileLock, Timeout
-import os
-# Force Streamlit Cloud to download the Chromium binary on boot
-os.system("playwright install chromium")
-# Apply nested loop patch for Streamlit cloud threads
+
 nest_asyncio.apply()
 
-# --- NANO-FEATURE: Granular Config & OS Directories ---
+# --- DIRECTORY & GLOBALS ---
 DATA_DIR = "./finder_data"
 os.makedirs(os.path.join(DATA_DIR, "cache"), exist_ok=True)
 
@@ -31,7 +41,7 @@ UAS = [
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Safari/605.1.15"
 ]
 
-# --- BULLETPROOF OS-LEVEL STORAGE ---
+# --- OS-LEVEL SAFE STORAGE ---
 class Storage:
     @classmethod
     def init_files(cls):
@@ -65,13 +75,12 @@ class Storage:
                     json.dump(data, f, indent=2)
                 os.replace(temp_path, path)
         except Timeout:
-            print(f"FileLock timeout on {filename}")
+            pass
 
-# --- THE GHOST EXTRACTOR (Memory-Safe & Stealthy) ---
+# --- THE GHOST EXTRACTOR ---
 class DeepExtractor:
     def __init__(self, settings):
         self.settings = settings
-        # Load existing links to prevent redundant writes
         db = Storage.load("results.json")
         self.global_found = set(r['invite_url'] for r in db) if db else set()
 
@@ -84,7 +93,7 @@ class DeepExtractor:
 
     async def tier3_to_5_playwright(self, url):
         js_links = []
-        browser = None # Declare here so the finally block can always access it
+        browser = None 
         
         async def handle_response(response):
             try:
@@ -95,7 +104,6 @@ class DeepExtractor:
 
         try:
             async with async_playwright() as p:
-                # Launch with extreme memory-saving flags
                 browser = await p.chromium.launch(
                     headless=True, 
                     args=['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--single-process']
@@ -103,9 +111,9 @@ class DeepExtractor:
                 context = await browser.new_context(user_agent=random.choice(UAS))
                 page = await context.new_page()
                 
-                # NANO-FEATURE: Inject stealth to bypass Cloudflare
-                if self.settings.get('stealth', True):
-                    await stealth_async(page)
+                # Dynamic stealth injection
+                if self.settings.get('stealth', True) and stealth:
+                    await stealth(page)
                     
                 page.on("response", handle_response)
                 page.set_default_timeout(self.settings['timeout'] * 1000)
@@ -130,10 +138,9 @@ class DeepExtractor:
                 final_html = await page.content()
                 js_links.extend(WA_REGEX.findall(final_html))
                 
-        except Exception as e:
+        except Exception:
             pass 
         finally:
-            # FIX: The ultimate Zombie-Process killer. Absolutely guarantees RAM release.
             if browser:
                 await browser.close()
 
@@ -178,7 +185,7 @@ class DeepExtractor:
             
         st.session_state.is_running = False
 
-# --- THREAD MANAGER WITH CONTEXT FIX ---
+# --- THREAD MANAGER ---
 def launch_crawler(urls):
     st.session_state.is_running = True
     st.session_state.live_queue = []
@@ -194,11 +201,10 @@ def launch_crawler(urls):
         loop.close()
         
     t = threading.Thread(target=worker, daemon=True)
-    # FIX: Attaches Streamlit's session context so the thread doesn't randomly abort
     add_script_run_ctx(t) 
     t.start()
 
-# --- FRONTEND ARCHITECTURE (Hard-Routed to prevent UI destruction) ---
+# --- FRONTEND ARCHITECTURE ---
 st.set_page_config(page_title="SCOLO Extractor", layout="wide")
 Storage.init_files()
 
@@ -206,7 +212,6 @@ for key in ['is_running', 'live_queue', 'stats']:
     if key not in st.session_state:
         st.session_state[key] = False if key == 'is_running' else [] if key == 'live_queue' else {'total':0, 'processed':0, 'active_url':''}
 
-# Sidebar Routing instead of Tabs
 st.sidebar.title("Navigation")
 page = st.sidebar.radio("Go to", ["Control Desk", "Live Radar", "Database Manager", "Sys Settings"])
 
@@ -226,7 +231,6 @@ if page == "Control Desk":
 
 elif page == "Live Radar":
     st.markdown("### Live Telemetry")
-    # FIX: Autorefresh ONLY runs when the user is explicitly on this page.
     if st.session_state.is_running:
         st_autorefresh(interval=2000, key="radar_ping")
         
@@ -239,11 +243,9 @@ elif page == "Database Manager":
     st.markdown("### Master Database")
     db_data = Storage.load("results.json")
     if db_data:
-        # FIX: Pagination / Truncation for JSON Bottleneck (Shows newest 500 to save UI memory)
         df_db = pd.DataFrame(db_data).tail(500)[::-1] 
-        
         df_db.insert(0, "Action", False)
-        # Because we aren't using tabs, autorefresh won't suddenly reset this editor!
+        
         edited = st.data_editor(df_db, use_container_width=True, hide_index=True)
         
         if st.button("Delete Selected Rows"):
@@ -257,7 +259,7 @@ elif page == "Sys Settings":
     settings = Storage.load("settings.json")
     
     new_conc = st.slider("Max Concurrency", 1, 5, settings.get('concurrency', 3))
-    use_stealth = st.toggle("Anti-Bot Stealth (Cloudflare Bypass)", value=settings.get('stealth', True))
+    use_stealth = st.toggle("Anti-Bot Stealth", value=settings.get('stealth', True))
     
     if st.button("Commit Configuration"):
         settings.update({"concurrency": new_conc, "stealth": use_stealth})
