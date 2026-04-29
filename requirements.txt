@@ -1,0 +1,10 @@
+streamlit>=1.30.0
+streamlit-autorefresh
+httpx
+beautifulsoup4
+lxml
+pandas
+playwright
+playwright-stealth
+filelock
+nest_asyncio
