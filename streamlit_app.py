@@ -1,589 +1,289 @@
-from __future__ import annotations
-
-import asyncio
-import html
+import os
+import streamlit as st
+import json
 import re
-import shutil
-import time
-from collections import defaultdict, deque
-from dataclasses import dataclass
-from datetime import datetime, timezone
-from typing import Callable, Awaitable
-from urllib.parse import urljoin, urlparse, urlunparse, unquote
-
+import html
+import urllib.parse
+import pandas as pd
+from datetime import datetime
+from urllib.parse import urljoin
 import httpx
 from bs4 import BeautifulSoup
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 
+# --- CORE BROWSER INIT ---
+@st.cache_resource(show_spinner=False)
+def install_browser():
+    os.system("playwright install chromium")
+install_browser()
 
-# FIX: Master Regex modified to ONLY catch chat/group links. Channels are completely ignored.
-WHATSAPP_RE = re.compile(
-    r"""(?ix)
-    https?://(?:
-        chat\.whatsapp\.com/(?:invite/)?[A-Za-z0-9_-]{8,}
-    )
-    """
-)
+# --- EPHEMERAL STATE MANAGEMENT (Cloud-Optimized) ---
+# We no longer rely on permanent local files. Everything lives in session state
+# and relies on the user importing/exporting their master backup.
+if 'master_db' not in st.session_state:
+    st.session_state.master_db = []
+if 'session_run' not in st.session_state:
+    st.session_state.session_run = []
 
-GOOD_CLICK_WORDS = {
-    "join", "join group", "join now", "join whatsapp", "join group now",
-    "i agree", "agree", "continue", "proceed", "rules", "invite",
-    "open group", "visit group", "whatsapp", "group", "click here"
+WA_REGEX = re.compile(r'(?:https?://)?(?:www\.)?(?:chat\.whatsapp\.com|wa\.me|wa\.link|whatsapp\.com/channel)/[A-Za-z0-9_-]+', re.IGNORECASE)
+
+AGENTS = {
+    "Googlebot Smartphone": "Mozilla/5.0 (Linux; Android 6.0.1; Nexus 5X Build/MMB29P) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Mobile Safari/537.36 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
+    "Chrome Windows": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 }
 
-# FIX: Added whatsapp domains to the absolute blacklist so the crawler NEVER visits them.
-BAD_HREF_PARTS = {
-    "pagead2.googlesyndication.com",
-    "doubleclick.net",
-    "googleads",
-    "/report",
-    "/addgroup",
-    "/login",
-    "/register",
-    "mailto:",
-    "tel:",
-    "javascript:void",
-    "whatsapp.com",  # Blocks crawler from visiting WA links
-    "wa.me"          # Blocks crawler from visiting WA links
-}
+STEALTH_PAYLOAD = """
+Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+Object.defineProperty(navigator, 'deviceMemory', {get: () => 8});
+Object.defineProperty(navigator, 'hardwareConcurrency', {get: () => 4});
+window.chrome = { runtime: {} };
+"""
 
-
-@dataclass
-class CrawlConfig:
-    max_pages: int = 150
-    max_depth: int = 3
-    http_concurrency: int = 12
-    browser_concurrency: int = 1
-    http_timeout: float = 12.0
-    browser_timeout_ms: int = 15000
-    max_pages_per_domain: int = 80
-    max_candidates_per_page: int = 18
-    enable_browser_fallback: bool = True
-    same_domain_only: bool = True
-    polite_mode: bool = True
-
-
-@dataclass
-class CrawlEvent:
-    kind: str
-    message: str
-    data: dict
-
-
-@dataclass
-class Candidate:
-    url: str
-    text: str
-    score: int
-    depth: int = 0
-    source_label: str = ""
-
-
-def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def clean_text(value: str | None) -> str:
-    if not value:
-        return ""
-    return re.sub(r"\s+", " ", html.unescape(value)).strip().lower()
-
-
-def normalize_page_url(raw: str | None, base: str | None = None) -> str | None:
-    if not raw:
-        return None
-
-    raw = html.unescape(unquote(str(raw).strip().strip('"').strip("'")))
-    if base:
-        raw = urljoin(base, raw)
-
-    parsed = urlparse(raw)
-
-    if parsed.scheme not in {"http", "https"}:
-        return None
-
-    netloc = parsed.netloc.lower()
-    path = parsed.path or "/"
-    return urlunparse((parsed.scheme, netloc, path, "", parsed.query, ""))
-
-
-def normalize_whatsapp_url(raw: str) -> str | None:
-    # FIX: Purged all channel logic. Pure, raw group invite extraction.
-    raw = html.unescape(unquote(str(raw).strip().strip('"').strip("'")))
-    parsed = urlparse(raw)
-    host = parsed.netloc.lower()
-    path = parsed.path.strip("/")
-
-    if host == "chat.whatsapp.com":
-        parts = path.split("/")
-        code = parts[-1] if parts else ""
-        if len(code) >= 8:
-            return f"https://chat.whatsapp.com/{code}"
-
-    return None
-
-
-def source_domain(url: str) -> str:
-    return urlparse(url).netloc.lower()
-
-
-def extract_whatsapp_links(text: str) -> list[str]:
-    found = []
-    for match in WHATSAPP_RE.findall(html.unescape(text or "")):
-        normalized = normalize_whatsapp_url(match)
-        if normalized:
-            found.append(normalized)
-    return list(dict.fromkeys(found))
-
-
-def is_bad_href(href: str) -> bool:
-    low = (href or "").lower()
-    return any(part in low for part in BAD_HREF_PARTS)
-
-
-def click_score(text: str, href: str) -> int:
-    t = clean_text(text)
-    h = clean_text(href)
-    combined = f"{t} {h}"
-
-    if any(bad in combined for bad in BAD_CLICK_WORDS):
-        return -10
-
-    score = 0
-
-    for good in GOOD_CLICK_WORDS:
-        if good in combined:
-            score += 3
-
-    if "/group/rules/" in h:
-        score += 10
-    if "/group/invite/" in h:
-        score += 8
-    # We still want to prioritize clicking elements that mention whatsapp, 
-    # but we won't follow the href if it's an actual WA link due to allowed_follow
-    if "button" in combined:
-        score += 1
-
-    return score
-
-
-def allowed_follow(candidate_url: str, start_url: str, config: CrawlConfig) -> bool:
-    c = urlparse(candidate_url)
-    s = urlparse(start_url)
-
-    if c.scheme not in {"http", "https"}:
-        return False
-
-    # This instantly kills WA links from ever being added to the crawl queue
-    if is_bad_href(candidate_url):
-        return False
-
-    if config.same_domain_only and c.netloc.lower() != s.netloc.lower():
-        return False
-
-    return True
-
-
-def make_result(invite_url: str, source_page: str, method: str, click_text: str = "") -> dict:
-    normalized = normalize_whatsapp_url(invite_url) or invite_url
-    return {
-        "invite_url": invite_url,
-        "normalized_url": normalized,
-        "source_page": source_page,
-        "source_domain": source_domain(source_page),
-        "source_label": "",
-        "discovered_at": now_iso(),
-        "extraction_method": method,
-        "click_text": click_text,
-    }
-
-
-def extract_candidates(html_text: str, page_url: str, root_url: str, config: CrawlConfig, depth: int) -> list[Candidate]:
-    soup = BeautifulSoup(html_text or "", "lxml")
-    candidates: list[Candidate] = []
-
-    for a in soup.select("a[href]"):
-        href = normalize_page_url(a.get("href"), page_url)
-        if not href:
-            continue
-
-        text = a.get_text(" ", strip=True) or a.get("title") or ""
-        score = click_score(text, href)
-
-        if score > 0 and allowed_follow(href, root_url, config):
-            candidates.append(Candidate(url=href, text=text, score=score, depth=depth + 1))
-
-    onclick_blob = " ".join(tag.get("onclick", "") for tag in soup.select("[onclick]"))
-    onclick_urls = re.findall(r"""['"]([^'"]*(?:/group/rules/|/group/invite/|chat\.whatsapp\.com)[^'"]*)['"]""", onclick_blob)
-
-    for raw in onclick_urls:
-        href = normalize_page_url(raw, page_url)
-        if href and allowed_follow(href, root_url, config):
-            candidates.append(Candidate(url=href, text="onclick", score=8, depth=depth + 1))
-
-    if depth < config.max_depth - 1:
-        for a in soup.select("a[href]"):
-            href = normalize_page_url(a.get("href"), page_url)
-            if not href or not allowed_follow(href, root_url, config):
-                continue
-            text = clean_text(a.get_text(" ", strip=True) or a.get("title") or "")
-            hlow = href.lower()
-            if any(x in text for x in ["next", "older", "more", "page"]) or any(x in hlow for x in ["page=", "/page/", "category", "groups"]):
-                if not is_bad_href(href):
-                    candidates.append(Candidate(url=href, text=text or "pagination", score=1, depth=depth + 1))
-
-    best: dict[str, Candidate] = {}
-    for c in candidates:
-        if c.url not in best or c.score > best[c.url].score:
-            best[c.url] = c
-
-    return sorted(best.values(), key=lambda x: x.score, reverse=True)[: config.max_candidates_per_page]
-
-
-async def fetch_page(client: httpx.AsyncClient, url: str) -> tuple[str, str]:
-    response = await client.get(url)
-    final_url = str(response.url)
-    text = response.text or ""
-    return final_url, text
-
-
-def find_chromium_executable() -> str | None:
-    for name in ["chromium", "chromium-browser", "google-chrome", "google-chrome-stable"]:
-        path = shutil.which(name)
-        if path:
-            return path
-    return None
-
-
-class BrowserPiercer:
-    def __init__(self, config: CrawlConfig):
+# --- THE LIGHTWEIGHT FUNNEL-PIERCING SPIDER ---
+class CloudPredator:
+    def __init__(self, config):
         self.config = config
-        self.hits: dict[str, dict] = {}
-
-    def capture(self, url: str, source_page: str, method: str, click_text: str = "") -> None:
-        normalized = normalize_whatsapp_url(url)
-        if normalized and normalized not in self.hits:
-            self.hits[normalized] = make_result(url, source_page, method, click_text)
-
-    async def pierce(self, start_url: str) -> list[dict]:
-        try:
-            from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
-        except Exception:
-            return []
-
-        executable_path = find_chromium_executable()
-
-        try:
-            async with async_playwright() as pw:
-                launch_args = {
-                    "headless": True,
-                    "args": ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+        self.visited_urls = set()
+        # Deduplicate against the in-memory master DB
+        self.global_links_found = set(r['invite_url'] for r in st.session_state.master_db)
+        self.session_found = []
+    
+    def normalize_and_store(self, raw_str, source_url):
+        decoded = html.unescape(urllib.parse.unquote(str(raw_str)))
+        matches = WA_REGEX.findall(decoded)
+        added_any = False
+        
+        for match in matches:
+            cln = match.lower().strip()
+            if not cln.startswith('http'):
+                cln = 'https://' + cln
+            if cln not in self.global_links_found:
+                self.global_links_found.add(cln)
+                entry = {
+                    "invite_url": cln,
+                    "source": source_url.split('/')[2] if '//' in source_url else source_url,
+                    "found_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 }
-                if executable_path:
-                    launch_args["executable_path"] = executable_path
+                self.session_found.append(entry)
+                # Push directly to Streamlit memory
+                st.session_state.master_db.append(entry)
+                st.session_state.session_run.append(entry)
+                added_any = True
+        return added_any
+        
+    def extract_funnel_links(self, html_content, base_url):
+        soup = BeautifulSoup(html_content, 'lxml')
+        funnel_paths = []
+        for a in soup.find_all('a', href=True):
+            href = a['href']
+            text = a.get_text().lower()
+            if href.startswith(('javascript:', 'mailto:', 'tel:', '#')): continue
+            full_url = urljoin(base_url, href)
+            if any(k in full_url.lower() for k in ['/invite/', '/join', '/rules', '/group/']) or any(k in text for k in ['join', 'agree', 'continue']):
+                funnel_paths.append(full_url)
+        return list(set(funnel_paths))
 
-                browser = await pw.chromium.launch(**launch_args)
-                context = await browser.new_context(
-                    java_script_enabled=True,
-                    ignore_https_errors=True,
-                    user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome Safari",
+    def assault_target(self, url):
+        next_layer_urls = []
+        try:
+            with sync_playwright() as p:
+                # Optimized args for 2.7GB RAM limit on Streamlit Cloud
+                args = ['--no-sandbox', '--disable-dev-shm-usage', '--disable-blink-features=AutomationControlled', '--single-process', '--disable-gpu']
+                if not self.config['load_images']: args.append('--blink-settings=imagesEnabled=false')
+                
+                browser = p.chromium.launch(headless=True, args=args)
+                context = browser.new_context(
+                    user_agent=AGENTS[self.config['user_agent']],
+                    viewport={'width': 1920, 'height': 1080},
+                    bypass_csp=True
                 )
+                
+                if self.config['inject_stealth']: context.add_init_script(STEALTH_PAYLOAD)
+                page = context.new_page()
+                page.set_default_timeout(self.config['pw_timeout'] * 1000)
 
-                async def route_handler(route):
-                    req_url = route.request.url
-                    if normalize_whatsapp_url(req_url):
-                        self.capture(req_url, start_url, "browser_network_intercept")
-                        await route.abort()
-                        return
-                    await route.continue_()
-
-                await context.route("**/*", route_handler)
-
-                def watch(page):
-                    page.on("request", lambda req: self.capture(req.url, page.url or start_url, "browser_request"))
-                    page.on("response", lambda res: self.capture(res.url, page.url or start_url, "browser_response"))
-                    page.on("framenavigated", lambda frame: self.capture(frame.url, page.url or start_url, "browser_frame_navigation"))
-
-                context.on("page", watch)
-                page = await context.new_page()
-                watch(page)
-
-                queue = deque([Candidate(start_url, "start", 100, 0)])
-                visited = set()
-                root_url = start_url
-
-                for _step in range(10):
-                    if self.hits or not queue:
-                        break
-
-                    cand = queue.popleft()
-                    current = normalize_page_url(cand.url)
-                    if not current or current in visited:
-                        continue
-                    visited.add(current)
-
-                    try:
-                        await page.goto(current, wait_until="domcontentloaded", timeout=self.config.browser_timeout_ms)
-                    except PlaywrightTimeoutError:
-                        pass
-                    except Exception:
-                        continue
-
-                    await page.wait_for_timeout(700)
-                    await self.scan_pages(context, cand.text)
-
-                    if self.hits:
-                        break
-
-                    try:
-                        html_text = await page.content()
-                        for c in extract_candidates(html_text, page.url, root_url, self.config, cand.depth):
-                            if c.url not in visited:
-                                queue.append(c)
-                    except Exception:
-                        pass
-
-                    await self.click_relevant_controls(context, root_url)
-                    await self.scan_pages(context, "after_click")
-
-                await context.close()
-                await browser.close()
-
-        except Exception:
-            return []
-
-        return list(self.hits.values())
-
-    async def scan_pages(self, context, click_text: str) -> None:
-        for page in list(context.pages):
-            try:
-                self.capture(page.url, page.url, "browser_current_url", click_text)
-                html_text = await page.content()
-                for link in extract_whatsapp_links(html_text + " " + page.url):
-                    self.capture(link, page.url, "browser_dom", click_text)
-            except Exception:
-                continue
-
-    async def click_relevant_controls(self, context, root_url: str) -> None:
-        selector = "a, button, [role='button'], input[type='button'], input[type='submit']"
-
-        for page in list(context.pages):
-            if self.hits:
-                return
-
-            try:
-                loc = page.locator(selector)
-                count = min(await loc.count(), 35)
-                scored = []
-
-                for i in range(count):
-                    el = loc.nth(i)
-                    try:
-                        if not await el.is_visible(timeout=500):
-                            continue
-
-                        try:
-                            text = await el.inner_text(timeout=500)
-                        except Exception:
-                            text = await el.get_attribute("value") or ""
-
-                        href = await el.get_attribute("href") or ""
-                        href_abs = normalize_page_url(href, page.url) if href else ""
-                        score = click_score(text, href_abs or text)
-
-                        if score <= 0:
-                            continue
-
-                        if href_abs and not allowed_follow(href_abs, root_url, self.config):
-                            continue
-
-                        scored.append((score, text, el))
-                    except Exception:
-                        continue
-
-                scored.sort(key=lambda x: x[0], reverse=True)
-
-                for _score, text, el in scored[:8]:
-                    if self.hits:
-                        return
-                    try:
-                        await el.scroll_into_view_if_needed(timeout=1000)
-                        await el.click(timeout=2500)
-                        await page.wait_for_timeout(700)
-                        await self.scan_pages(context, text)
-                    except Exception:
-                        continue
-
-            except Exception:
-                continue
-
-
-async def run_crawl_job(
-    seeds: list[str],
-    config: CrawlConfig,
-    on_event: Callable[[CrawlEvent], None] | None = None,
-) -> dict:
-    def emit(kind: str, message: str, data: dict | None = None) -> None:
-        if on_event:
-            on_event(CrawlEvent(kind=kind, message=message, data=data or {}))
-
-    queue: asyncio.Queue[Candidate] = asyncio.Queue()
-    visited: set[str] = set()
-    found: dict[str, dict] = {}
-    domain_counts = defaultdict(int)
-    root_by_url: dict[str, str] = {}
-    browser_queue: asyncio.Queue[tuple[str, str]] = asyncio.Queue()
-
-    for raw in seeds:
-        url = normalize_page_url(raw)
-        if not url:
-            emit("log", f"Skipped invalid seed: {raw}", {"raw": raw})
-            continue
-        root_by_url[url] = url
-        await queue.put(Candidate(url=url, text="seed", score=100, depth=0))
-
-    counters = {
-        "queued": queue.qsize(),
-        "visited": 0,
-        "found": 0,
-        "duplicates": 0,
-        "failed": 0,
-        "browser_pages": 0,
-    }
-
-    limits_hit = False
-
-    async with httpx.AsyncClient(
-        timeout=config.http_timeout,
-        follow_redirects=True,
-        headers={
-            "Accept": "text/html,application/xhtml+xml",
-            "User-Agent": "Mozilla/5.0 (compatible; StreamlitGroupFinder/1.0)",
-        },
-    ) as client:
-        sem = asyncio.Semaphore(config.http_concurrency)
-
-        async def process_candidate(worker_id: int) -> None:
-            nonlocal limits_hit
-
-            while not queue.empty() and len(visited) < config.max_pages:
-                cand = await queue.get()
-                url = normalize_page_url(cand.url)
-                if not url or url in visited:
-                    queue.task_done()
-                    continue
-
-                if cand.depth > config.max_depth:
-                    queue.task_done()
-                    continue
-
-                dom = source_domain(url)
-                if domain_counts[dom] >= config.max_pages_per_domain:
-                    queue.task_done()
-                    continue
-
-                visited.add(url)
-                domain_counts[dom] += 1
-
-                counters["visited"] = len(visited)
-                counters["queued"] = queue.qsize()
-                emit("status", f"Fetching: {url}", {"counters": counters})
+                def handle_request(route, request):
+                    if "chat.whatsapp.com" in request.url or "wa.me" in request.url:
+                        self.normalize_and_store(request.url, url)
+                    route.continue_()
+                
+                page.route("**/*", handle_request)
 
                 try:
-                    async with sem:
-                        final_url, body = await fetch_page(client, url)
+                    page.goto(url, wait_until="domcontentloaded")
+                    page.wait_for_timeout(self.config['page_delay'] * 1000) 
+                except PlaywrightTimeout:
+                    pass
 
-                    combined = body + " " + final_url
-                    links = extract_whatsapp_links(combined)
+                if self.config['auto_click']:
+                    click_targets = page.locator("a, button, div.button1, span.joinbtn").filter(has_text=re.compile(fr"({self.config['click_keywords']})", re.I))
+                    for i in range(min(click_targets.count(), self.config['max_clicks'])):
+                        try:
+                            loc = click_targets.nth(i)
+                            if loc.is_visible():
+                                loc.click(force=True, timeout=1000)
+                                page.wait_for_timeout(1000) 
+                        except: pass
 
-                    if links:
-                        for link in links:
-                            row = make_result(link, final_url, "http_html")
-                            norm = row["normalized_url"]
-                            if norm not in found:
-                                found[norm] = row
-                                counters["found"] = len(found)
-                                emit("result", f"Found: {norm}", {"row": row})
-                            else:
-                                counters["duplicates"] += 1
-                        queue.task_done()
-                        continue
+                html_body = ""
+                try: html_body = page.content()
+                except: pass
+                
+                self.normalize_and_store(html_body, url)
 
-                    root = root_by_url.get(url) or url
-                    candidates = extract_candidates(body, final_url, root, config, cand.depth)
+                if self.config['deep_crawl'] and html_body:
+                    next_layer_urls = self.extract_funnel_links(html_body, url)
 
-                    good_internal_candidates = [c for c in candidates if c.score >= 5]
+                browser.close()
+        except Exception:
+            pass
+            
+        return next_layer_urls
 
-                    for c in candidates:
-                        if len(visited) + queue.qsize() >= config.max_pages:
-                            limits_hit = True
-                            break
-                        c_url = normalize_page_url(c.url, final_url)
-                        if c_url and c_url not in visited:
-                            root_by_url[c_url] = root
-                            await queue.put(c)
+    def execute_hunt(self, root_urls, ui_status, ui_bar, ui_stats):
+        queue = [{'url': ru, 'depth': 0} for ru in root_urls]
+        pages_processed = 0
+        
+        while queue and pages_processed < self.config['global_max_pages']:
+            current = queue.pop(0)
+            target_url = current['url']
+            current_depth = current['depth']
+            
+            if target_url in self.visited_urls: continue
+                
+            self.visited_urls.add(target_url)
+            ui_status.markdown(f"**Breaching Depth [{current_depth}]:** `{target_url}`")
+            
+            funnel_links = self.assault_target(target_url)
+            
+            if self.config['deep_crawl'] and current_depth < self.config['max_depth']:
+                added = 0
+                for f_link in funnel_links:
+                    if f_link not in self.visited_urls and added < self.config['max_internals_per_page']:
+                        queue.append({'url': f_link, 'depth': current_depth + 1})
+                        added += 1
+                        
+            pages_processed += 1
+            
+            p = min(1.0, pages_processed / self.config['global_max_pages'])
+            ui_bar.progress(p)
+            ui_stats.info(f"🕷️ Pages Swept: **{pages_processed}** | 📝 Queued: **{len(queue)}** | 🔗 New Links: **{len(self.session_found)}**")
+            
+        return self.session_found
 
-                    if config.enable_browser_fallback and good_internal_candidates and config.browser_concurrency > 0:
-                        await browser_queue.put((final_url, root))
 
-                except Exception as exc:
-                    counters["failed"] += 1
-                    emit("log", f"HTTP failed: {url} -> {exc}", {"url": url, "error": str(exc)})
+# --- FRONTEND UI DASHBOARD ---
+st.set_page_config(page_title="SCOLO Cloud Extractor", layout="wide", initial_sidebar_state="expanded")
 
-                finally:
-                    queue.task_done()
+with st.sidebar:
+    st.header("⚙️ Engine Configuration")
+    
+    with st.expander("🤖 Identity & Stealth", expanded=True):
+        u_agent = st.selectbox("Spoof Identity", list(AGENTS.keys()))
+        inject_stealth = st.toggle("Override Hardware Signatures", value=True)
+        
+    with st.expander("🕸️ Rat-Maze Tracker", expanded=True):
+        do_deep = st.toggle("Chase Internal 'Join' Links", value=True)
+        max_depth = st.slider("Maximum Depth Limit", 1, 5, 2)
+        max_inter = st.slider("Max Links To Chase Per Page", 1, 20, 5)
+        global_cap = st.slider("Total Page Kill-Switch", 1, 100, 20, help="Keep this low to prevent Streamlit Cloud from throttling CPU.")
+        
+    with st.expander("⚡ Interaction Rules", expanded=True):
+        auto_click = st.toggle("Aggressively Click Elements", value=True)
+        click_kws = st.text_input("Regex Trigger Words", value="join|agree|continue|rules")
+        max_clx = st.slider("Max Clicks Per Page", 1, 10, 3)
+        
+    with st.expander("⏱️ Cloud Timing Limitations"):
+        load_images = st.toggle("Load Images", value=False)
+        pw_tout = st.slider("Browser Timeout (sec)", 10, 60, 15)
+        pg_delay = st.slider("DDoS Wait (sec)", 1, 10, 2)
 
-        workers = [asyncio.create_task(process_candidate(i)) for i in range(max(1, config.http_concurrency))]
+CONFIG = {
+    'user_agent': u_agent, 'inject_stealth': inject_stealth,
+    'deep_crawl': do_deep, 'max_depth': max_depth, 'max_internals_per_page': max_inter,
+    'global_max_pages': global_cap, 'headless': True, 'load_images': load_images, 
+    'auto_click': auto_click, 'click_keywords': click_kws, 'max_clicks': max_clx, 
+    'pw_timeout': pw_tout, 'page_delay': pg_delay
+}
 
-        while any(not w.done() for w in workers):
-            await asyncio.sleep(0.1)
-            if queue.empty():
-                await asyncio.sleep(0.2)
+st.title("☁️ Cloud-Optimized Link Extractor")
+st.markdown("*Memory-safe, ephemeral architecture designed specifically for Streamlit Cloud constraints.*")
 
-        await asyncio.gather(*workers, return_exceptions=True)
+# --- STATE REHYDRATION (IMPORT/EXPORT) ---
+with st.expander("💾 State Management (CRITICAL FOR CLOUD DEPLOYMENTS)", expanded=not bool(st.session_state.master_db)):
+    st.warning("Streamlit Cloud containers reset frequently. You MUST export your database to save it, and re-upload it here to restore your deduplication memory.")
+    
+    col_up, col_down = st.columns(2)
+    with col_up:
+        uploaded_file = st.file_uploader("Upload Previous State Backup (JSON)", type="json")
+        if uploaded_file is not None and st.button("Restore Memory State"):
+            try:
+                restored_data = json.load(uploaded_file)
+                st.session_state.master_db = restored_data
+                st.success(f"Restored {len(restored_data)} links into memory.")
+                st.rerun()
+            except Exception as e:
+                st.error("Failed to parse JSON backup.")
+                
+    with col_down:
+        if st.session_state.master_db:
+            export_json = json.dumps(st.session_state.master_db, indent=2).encode('utf-8')
+            st.download_button(
+                label="📥 Export Master Backup (JSON)",
+                data=export_json,
+                file_name=f"wa_backup_state_{datetime.now().strftime('%Y%m%d_%H%M')}.json",
+                mime="application/json",
+                type="primary",
+                use_container_width=True
+            )
 
-    if config.enable_browser_fallback and config.browser_concurrency > 0 and not browser_queue.empty():
-        browser_sem = asyncio.Semaphore(config.browser_concurrency)
+st.divider()
 
-        async def browser_worker(i: int) -> None:
-            while not browser_queue.empty():
-                page_url, _root = await browser_queue.get()
-                if counters["browser_pages"] >= max(1, config.browser_concurrency * 25):
-                    browser_queue.task_done()
-                    continue
+c1, c2 = st.columns([1.2, 2])
 
-                async with browser_sem:
-                    counters["browser_pages"] += 1
-                    emit("status", f"Rendering JS fallback: {page_url}", {"counters": counters})
-                    try:
-                        piercer = BrowserPiercer(config)
-                        rows = await piercer.pierce(page_url)
-                        for row in rows:
-                            norm = row["normalized_url"]
-                            if norm not in found:
-                                found[norm] = row
-                                counters["found"] = len(found)
-                                emit("result", f"Found via browser: {norm}", {"row": row})
-                            else:
-                                counters["duplicates"] += 1
-                    except Exception as exc:
-                        counters["failed"] += 1
-                        emit("log", f"Browser fallback failed: {page_url} -> {exc}", {"url": page_url, "error": str(exc)})
-                    finally:
-                        browser_queue.task_done()
+with c1:
+    st.subheader("1. Target Acquisition")
+    seed_input = st.text_area("Paste Directory URLs", placeholder="https://groupsor.link/", height=130)
+    
+    if st.button("🔥 INITIATE CLOUD BREACH", type="primary", use_container_width=True):
+        urls = [u.strip() for u in seed_input.split('\n') if u.strip().startswith('http')]
+        if not urls:
+            st.error("I need a valid HTTP/HTTPS target.")
+        else:
+            st.session_state.session_run = []
+            ui_status = st.empty()
+            ui_bar = st.progress(0.0)
+            ui_stats = st.empty()
+            
+            predator = CloudPredator(CONFIG)
+            predator.execute_hunt(urls, ui_status, ui_bar, ui_stats)
+            
+            ui_status.success(f"Execution complete. Swept {len(st.session_state.session_run)} new links into memory.")
+            ui_bar.progress(1.0)
 
-        bworkers = [asyncio.create_task(browser_worker(i)) for i in range(config.browser_concurrency)]
-        await asyncio.gather(*bworkers, return_exceptions=True)
-
-    summary = {
-        "visited": len(visited),
-        "found_unique": len(found),
-        "duplicates": counters["duplicates"],
-        "failed": counters["failed"],
-        "browser_pages": counters["browser_pages"],
-        "limits_hit": limits_hit,
-        "finished_at": now_iso(),
-    }
-
-    emit("status", "Job complete", {"counters": counters, "summary": summary})
-    emit("log", "Job complete", summary)
-    return summary
+with c2:
+    st.subheader(f"2. Ephemeral Memory DB ({len(st.session_state.master_db)} total)")
+    
+    if not st.session_state.master_db:
+        st.info("Memory is empty. Upload a backup or run a breach.")
+    else:
+        df = pd.DataFrame(st.session_state.master_db)[::-1]
+        df.insert(0, "Wipe", False)
+        
+        editor = st.data_editor(df, use_container_width=True, hide_index=True)
+        
+        ca, cb = st.columns(2)
+        with ca:
+            if st.button("❌ Delete Checked", use_container_width=True):
+                wipe_list = editor[editor['Wipe']]['invite_url'].tolist()
+                st.session_state.master_db = [x for x in st.session_state.master_db if x['invite_url'] not in wipe_list]
+                st.rerun()
+        with cb:
+            csv_data = pd.DataFrame(st.session_state.master_db).drop(columns=['Wipe'], errors='ignore').to_csv(index=False).encode('utf-8')
+            st.download_button("📊 Download as CSV", csv_data, "whatsapp_links.csv", "text/csv", use_container_width=True)
+            
+        st.write("")
+        if st.button("☢️ PURGE ACTIVE MEMORY"):
+            st.session_state.master_db = []
+            st.session_state.session_run = []
+            st.rerun()
