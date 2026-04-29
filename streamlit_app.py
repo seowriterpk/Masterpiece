@@ -1,267 +1,177 @@
 import os
 import streamlit as st
+import json
+import re
+import pandas as pd
+from datetime import datetime
+import httpx
+from bs4 import BeautifulSoup
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 
-# NANO-FEATURE: Run browser install ONLY once per server boot to prevent UI lag
+# Force Streamlit to install the browser on boot
 @st.cache_resource(show_spinner=False)
 def install_browser():
     os.system("playwright install chromium")
 install_browser()
 
-from streamlit.runtime.scriptrunner import add_script_run_ctx
-from streamlit_autorefresh import st_autorefresh
-import httpx
-import asyncio
-import json
-import re
-import pandas as pd
-from datetime import datetime
-from bs4 import BeautifulSoup
-from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
-
-# FIX: Dynamic stealth import. If the library renames itself again, we bypass it instead of crashing.
-try:
-    from playwright_stealth import stealth
-except ImportError:
-    stealth = None
-
-import threading
-import random
-import nest_asyncio
-from filelock import FileLock, Timeout
-
-nest_asyncio.apply()
-
-# --- DIRECTORY & GLOBALS ---
+# --- GLOBALS & SIMPLE STORAGE ---
 DATA_DIR = "./finder_data"
-os.makedirs(os.path.join(DATA_DIR, "cache"), exist_ok=True)
+os.makedirs(DATA_DIR, exist_ok=True)
+DB_FILE = os.path.join(DATA_DIR, "results.json")
+
+if not os.path.exists(DB_FILE):
+    with open(DB_FILE, 'w') as f:
+        json.dump([], f)
+
+def load_db():
+    try:
+        with open(DB_FILE, 'r') as f:
+            return json.load(f)
+    except:
+        return []
+
+def save_db(data):
+    with open(DB_FILE, 'w') as f:
+        json.dump(data, f, indent=2)
 
 WA_REGEX = re.compile(r'(https?://(?:chat\.whatsapp\.com|wa\.me|whatsapp\.com/channel)/[A-Za-z0-9_-]+)', re.IGNORECASE)
-UAS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Safari/605.1.15"
-]
 
-# --- OS-LEVEL SAFE STORAGE ---
-class Storage:
-    @classmethod
-    def init_files(cls):
-        files = {"results.json": [], "logs.json": [], "settings.json": {
-            "concurrency": 3, "timeout": 15, "use_js": True, "stealth": True
-        }}
-        for f, default in files.items():
-            path = os.path.join(DATA_DIR, f)
-            if not os.path.exists(path):
-                cls.save(f, default)
-
-    @classmethod
-    def load(cls, filename):
-        path = os.path.join(DATA_DIR, filename)
-        lock = FileLock(f"{path}.lock", timeout=5)
-        try:
-            with lock:
-                with open(path, 'r') as f:
-                    return json.load(f)
-        except (json.JSONDecodeError, FileNotFoundError, Timeout):
-            return [] if filename != "settings.json" else {}
-
-    @classmethod
-    def save(cls, filename, data):
-        path = os.path.join(DATA_DIR, filename)
-        lock = FileLock(f"{path}.lock", timeout=5)
-        try:
-            with lock:
-                temp_path = f"{path}.tmp"
-                with open(temp_path, 'w') as f:
-                    json.dump(data, f, indent=2)
-                os.replace(temp_path, path)
-        except Timeout:
-            pass
-
-# --- THE GHOST EXTRACTOR ---
-class DeepExtractor:
-    def __init__(self, settings):
-        self.settings = settings
-        db = Storage.load("results.json")
-        self.global_found = set(r['invite_url'] for r in db) if db else set()
-
-    async def tier1_httpx(self, url, client):
-        try:
-            resp = await client.get(url, headers={"User-Agent": random.choice(UAS)}, follow_redirects=True, timeout=self.settings['timeout'])
-            return WA_REGEX.findall(resp.text), resp.text
-        except:
-            return [], ""
-
-    async def tier3_to_5_playwright(self, url):
-        js_links = []
-        browser = None 
+# --- THE SIMPLE SYNCHRONOUS EXTRACTOR ---
+def extract_links(url, use_js=True):
+    found_links = []
+    
+    # 1. Fast HTTP Check
+    try:
+        resp = httpx.get(url, timeout=10, follow_redirects=True, headers={"User-Agent": "Mozilla/5.0"})
+        found_links.extend(WA_REGEX.findall(resp.text))
         
-        async def handle_response(response):
-            try:
-                if response.ok and response.request.resource_type in ["fetch", "xhr"]:
-                    text = await response.text()
-                    js_links.extend(WA_REGEX.findall(text))
-            except: pass
+        soup = BeautifulSoup(resp.text, 'lxml')
+        for a in soup.find_all('a', href=True):
+            found_links.extend(WA_REGEX.findall(a['href']))
+    except Exception as e:
+        pass
 
+    # 2. Playwright JS Check (Only if requested)
+    if use_js:
         try:
-            async with async_playwright() as p:
-                browser = await p.chromium.launch(
-                    headless=True, 
-                    args=['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--single-process']
-                )
-                context = await browser.new_context(user_agent=random.choice(UAS))
-                page = await context.new_page()
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-dev-shm-usage'])
+                page = browser.new_page()
+                page.set_default_timeout(15000)
                 
-                # Dynamic stealth injection
-                if self.settings.get('stealth', True) and stealth:
-                    await stealth(page)
-                    
-                page.on("response", handle_response)
-                page.set_default_timeout(self.settings['timeout'] * 1000)
+                # Network sniffer
+                page.on("response", lambda response: found_links.extend(WA_REGEX.findall(response.text())) if response.ok and response.request.resource_type in ["fetch", "xhr"] else None)
                 
                 try:
-                    await page.goto(url, wait_until="domcontentloaded")
+                    page.goto(url, wait_until="domcontentloaded")
                 except PlaywrightTimeout:
                     pass
-
-                # Aggressive clicking
-                if self.settings.get('use_js', True):
-                    try:
-                        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                        await page.wait_for_timeout(1000)
-                        buttons = await page.locator("text=/(join|whatsapp|wa\\.me|chat|group)/i").all()
-                        for btn in buttons[:2]:
-                            if await btn.is_visible():
-                                await btn.click(force=True, timeout=1000)
-                                await page.wait_for_timeout(800)
-                    except: pass
-                    
-                final_html = await page.content()
-                js_links.extend(WA_REGEX.findall(final_html))
                 
+                # Aggressive scroll & click
+                try:
+                    page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                    page.wait_for_timeout(1000)
+                    buttons = page.locator("text=/(join|whatsapp|wa\\.me|chat|group)/i").all()
+                    for btn in buttons[:2]:
+                        if btn.is_visible():
+                            btn.click(force=True, timeout=1000)
+                            page.wait_for_timeout(500)
+                except:
+                    pass
+                
+                found_links.extend(WA_REGEX.findall(page.content()))
+                browser.close()
         except Exception:
-            pass 
-        finally:
-            if browser:
-                await browser.close()
-
-        return js_links
-
-    async def process_url(self, url, sem, client):
-        async with sem:
-            st.session_state.stats['active_url'] = url
-            found_this_run = set()
-
-            t1_links, raw_html = await self.tier1_httpx(url, client)
-            found_this_run.update(t1_links)
-
-            if not found_this_run or self.settings.get('use_js', True):
-                t3_links = await self.tier3_to_5_playwright(url)
-                found_this_run.update(t3_links)
-
-            new_inserts = []
-            for link in found_this_run:
-                if link not in self.global_found:
-                    self.global_found.add(link)
-                    rec = {
-                        "invite_url": link, "source_domain": url.split('/')[2] if '//' in url else url,
-                        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "status": "New"
-                    }
-                    new_inserts.append(rec)
-                    st.session_state.live_queue.append(rec)
-
-            if new_inserts:
-                db = Storage.load("results.json")
-                db.extend(new_inserts)
-                Storage.save("results.json", db)
-
-            st.session_state.stats['processed'] += 1
-
-    async def orchestrate(self, urls):
-        sem = asyncio.Semaphore(min(self.settings.get('concurrency', 3), 5))
-        limits = httpx.Limits(max_keepalive_connections=10, max_connections=20)
-        async with httpx.AsyncClient(verify=False, limits=limits) as client:
-            tasks = [self.process_url(u, sem, client) for u in urls]
-            await asyncio.gather(*tasks, return_exceptions=True)
+            pass
             
-        st.session_state.is_running = False
+    return list(set(found_links))
 
-# --- THREAD MANAGER ---
-def launch_crawler(urls):
-    st.session_state.is_running = True
-    st.session_state.live_queue = []
-    st.session_state.stats = {'total': len(urls), 'processed': 0, 'active_url': ''}
-    settings = Storage.load("settings.json")
+# --- UI / WEBSITE SYSTEM ---
+st.set_page_config(page_title="Saeed's Link Finder", layout="wide")
+
+st.title("🕷️ WA Group Finder")
+st.write("A clean, server-processed system to discover and manage WhatsApp links.")
+
+# Session memory for the live run
+if 'current_run' not in st.session_state:
+    st.session_state.current_run = []
+
+col1, col2 = st.columns([1, 2])
+
+with col1:
+    st.subheader("1. Input Targets")
+    urls_input = st.text_area("Paste URLs here (one per line)", height=150)
+    use_js = st.checkbox("Use Deep JS Scraping (Slower, but finds hidden links)", value=True)
     
-    extractor = DeepExtractor(settings)
-    
-    def worker():
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(extractor.orchestrate(urls))
-        loop.close()
-        
-    t = threading.Thread(target=worker, daemon=True)
-    add_script_run_ctx(t) 
-    t.start()
-
-# --- FRONTEND ARCHITECTURE ---
-st.set_page_config(page_title="SCOLO Extractor", layout="wide")
-Storage.init_files()
-
-for key in ['is_running', 'live_queue', 'stats']:
-    if key not in st.session_state:
-        st.session_state[key] = False if key == 'is_running' else [] if key == 'live_queue' else {'total':0, 'processed':0, 'active_url':''}
-
-st.sidebar.title("Navigation")
-page = st.sidebar.radio("Go to", ["Control Desk", "Live Radar", "Database Manager", "Sys Settings"])
-
-if page == "Control Desk":
-    st.markdown("### Target Acquisition")
-    target_input = st.text_area("Input URLs (Batch Mode)")
-    
-    if st.button("EXECUTE SWARM", type="primary", disabled=st.session_state.is_running):
-        clean_urls = [u.strip() for u in target_input.split('\n') if u.strip().startswith('http')]
-        if clean_urls:
-            launch_crawler(clean_urls)
-            st.rerun()
+    if st.button("🚀 Start Processing", type="primary"):
+        urls = [u.strip() for u in urls_input.split('\n') if u.strip().startswith('http')]
+        if not urls:
+            st.warning("Please enter valid URLs.")
+        else:
+            st.session_state.current_run = []
+            db = load_db()
+            global_found = set(r['invite_url'] for r in db)
             
-    if st.session_state.is_running:
-        st.progress(st.session_state.stats['processed'] / max(1, st.session_state.stats['total']))
-        st.caption(f"Assaulting: {st.session_state.stats['active_url']}")
+            # Placeholders for live UI updates
+            status_text = st.empty()
+            progress_bar = st.progress(0)
+            live_table = st.empty()
+            
+            for i, url in enumerate(urls):
+                status_text.text(f"Processing ({i+1}/{len(urls)}): {url}")
+                
+                # Run extraction
+                new_links = extract_links(url, use_js=use_js)
+                
+                # Save & Display
+                added_count = 0
+                for link in new_links:
+                    if link not in global_found:
+                        global_found.add(link)
+                        rec = {
+                            "invite_url": link,
+                            "source_domain": url.split('/')[2] if '//' in url else url,
+                            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        }
+                        db.append(rec)
+                        st.session_state.current_run.append(rec)
+                        added_count += 1
+                
+                if added_count > 0:
+                    save_db(db) # Save to browser/server storage immediately
+                
+                # Update live table
+                if st.session_state.current_run:
+                    live_table.dataframe(pd.DataFrame(st.session_state.current_run), use_container_width=True)
+                
+                progress_bar.progress((i + 1) / len(urls))
+                
+            status_text.success(f"Done! Found {len(st.session_state.current_run)} new links in this batch.")
 
-elif page == "Live Radar":
-    st.markdown("### Live Telemetry")
-    if st.session_state.is_running:
-        st_autorefresh(interval=2000, key="radar_ping")
+with col2:
+    st.subheader("2. Database Manager")
+    db = load_db()
+    if db:
+        df = pd.DataFrame(db)[::-1] # Reverse to show newest first
+        df.insert(0, "Delete", False)
         
-    if st.session_state.live_queue:
-        st.dataframe(pd.DataFrame(st.session_state.live_queue), use_container_width=True)
+        edited_df = st.data_editor(df, use_container_width=True, hide_index=True)
+        
+        col_a, col_b = st.columns(2)
+        with col_a:
+            if st.button("🗑️ Remove Selected"):
+                to_delete = edited_df[edited_df['Delete']]['invite_url'].tolist()
+                new_db = [r for r in db if r['invite_url'] not in to_delete]
+                save_db(new_db)
+                st.rerun()
+        with col_b:
+            csv = pd.DataFrame(db).to_csv(index=False).encode('utf-8')
+            st.download_button("💾 Export All to CSV", csv, "wa_links.csv", "text/csv")
     else:
-        st.info("Radar clear. Awaiting data.")
+        st.info("No links in database yet.")
 
-elif page == "Database Manager":
-    st.markdown("### Master Database")
-    db_data = Storage.load("results.json")
-    if db_data:
-        df_db = pd.DataFrame(db_data).tail(500)[::-1] 
-        df_db.insert(0, "Action", False)
-        
-        edited = st.data_editor(df_db, use_container_width=True, hide_index=True)
-        
-        if st.button("Delete Selected Rows"):
-            urls_to_delete = edited[edited['Action']]['invite_url'].tolist()
-            new_db = [r for r in db_data if r['invite_url'] not in urls_to_delete]
-            Storage.save("results.json", new_db)
-            st.rerun()
-
-elif page == "Sys Settings":
-    st.markdown("### Engine Configuration")
-    settings = Storage.load("settings.json")
-    
-    new_conc = st.slider("Max Concurrency", 1, 5, settings.get('concurrency', 3))
-    use_stealth = st.toggle("Anti-Bot Stealth", value=settings.get('stealth', True))
-    
-    if st.button("Commit Configuration"):
-        settings.update({"concurrency": new_conc, "stealth": use_stealth})
-        Storage.save("settings.json", settings)
-        st.success("Config locked.")
+st.divider()
+if st.button("⚠️ Format System (Delete Everything)"):
+    save_db([])
+    st.session_state.current_run = []
+    st.rerun()
