@@ -15,7 +15,9 @@ import threading
 import random
 import nest_asyncio
 from filelock import FileLock, Timeout
-
+import os
+# Force Streamlit Cloud to download the Chromium binary on boot
+os.system("playwright install chromium")
 # Apply nested loop patch for Streamlit cloud threads
 nest_asyncio.apply()
 
